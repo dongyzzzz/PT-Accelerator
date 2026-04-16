@@ -126,19 +126,56 @@
           </button>
         </header>
 
-        <div class="probe-log-viewer">
-          <div v-if="history.length === 0" class="workspace-empty logs-empty">
-            <i class="bx bx-history"></i>
-            <strong>暂无探活记录</strong>
-            <span>等待定时探活执行或手动触发后，这里会显示结果。</span>
-          </div>
-          <div v-else class="probe-log-list">
-            <div class="probe-log-row" v-for="item in history" :key="`${item.timestamp}-${item.status}-${item.message}`">
-              <div class="probe-log-meta">
-                <span class="probe-badge" :class="`probe-badge-${item.status}`">{{ formatStatus(item.status) }}</span>
-                <span class="mono-text">{{ item.time || formatTime(item.timestamp) }}</span>
+        <div class="logs-split">
+          <div class="probe-log-viewer">
+            <div v-if="history.length === 0" class="workspace-empty logs-empty">
+              <i class="bx bx-history"></i>
+              <strong>暂无探活记录</strong>
+              <span>等待定时探活执行或手动触发后，这里会显示结果。</span>
+            </div>
+            <div v-else class="probe-log-list">
+              <div class="probe-log-row" v-for="item in history" :key="`${item.timestamp}-${item.status}-${item.message}`">
+                <div class="probe-log-meta">
+                  <span class="probe-badge" :class="`probe-badge-${item.status}`">{{ formatStatus(item.status) }}</span>
+                  <span class="mono-text">{{ item.time || formatTime(item.timestamp) }}</span>
+                </div>
+                <div class="probe-log-message">{{ item.message }}</div>
               </div>
-              <div class="probe-log-message">{{ item.message }}</div>
+            </div>
+          </div>
+
+          <div class="uptime-panel">
+            <div class="uptime-panel-header">
+              <h4>稳定IP维持记录 <span class="log-count">({{ uptimeHistory.length }}条)</span></h4>
+              <p>展示探活判定为正常时，同一IP的连续维持区间（最近20条）。</p>
+            </div>
+            <div v-if="uptimeHistory.length === 0" class="workspace-empty logs-empty uptime-empty">
+              <i class="bx bx-timer"></i>
+              <strong>暂无稳定维持记录</strong>
+            </div>
+            <div v-else class="uptime-table-wrap">
+              <table class="uptime-table">
+                <thead>
+                  <tr>
+                    <th>IP</th>
+                    <th>开始时间</th>
+                    <th>结束时间</th>
+                    <th>持续时长</th>
+                    <th>结束原因</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr v-for="item in uptimeHistory" :key="`${item.ip}-${item.start_timestamp}-${item.end_timestamp}`">
+                    <td class="mono-text">{{ item.ip || '--' }}</td>
+                    <td class="mono-text">{{ item.start_time || formatTime(item.start_timestamp) }}</td>
+                    <td class="mono-text">
+                      {{ item.ongoing ? '进行中' : (item.end_time || formatTime(item.end_timestamp)) }}
+                    </td>
+                    <td>{{ formatDuration(item.duration_seconds, item.ongoing) }}</td>
+                    <td>{{ formatEndReason(item.end_reason, item.ongoing) }}</td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
           </div>
         </div>
@@ -175,6 +212,17 @@ interface ProbeHistoryItem {
   message: string;
 }
 
+interface ProbeIpUptimeItem {
+  ip: string;
+  start_timestamp: number;
+  start_time?: string;
+  end_timestamp: number;
+  end_time?: string;
+  duration_seconds: number;
+  ongoing: boolean;
+  end_reason?: string;
+}
+
 const toast = useToast();
 const { confirm } = useConfirm();
 const { isMobile } = useMobile();
@@ -187,6 +235,7 @@ const clearingHistory = ref(false);
 const savingConfig = ref(false);
 const runtimeStatus = ref<ProbeRuntimeStatus | null>(null);
 const history = ref<ProbeHistoryItem[]>([]);
+const uptimeHistory = ref<ProbeIpUptimeItem[]>([]);
 let pollTimer: number | null = null;
 
 const probeConfig = reactive({
@@ -268,8 +317,18 @@ const loadProbeHistory = async (limit: number = 200) => {
   }
 };
 
+const loadProbeIpUptime = async (limit: number = 20) => {
+  try {
+    const response = await axios.get(`/cloudflare-probe/ip-uptime?limit=${limit}`);
+    uptimeHistory.value = Array.isArray(response.data?.items) ? response.data.items : [];
+  } catch (e) {
+    console.error('Failed to fetch probe ip uptime history', e);
+    uptimeHistory.value = [];
+  }
+};
+
 const refreshProbeData = async () => {
-  await Promise.all([loadProbeStatus(), loadProbeHistory()]);
+  await Promise.all([loadProbeStatus(), loadProbeHistory(), loadProbeIpUptime()]);
 };
 
 const saveProbeConfig = async () => {
@@ -315,6 +374,7 @@ const clearHistory = async () => {
   try {
     await axios.post('/cloudflare-probe/history/clear');
     history.value = [];
+    uptimeHistory.value = [];
     toast.success('探活历史已清空');
     await loadProbeStatus();
   } catch (e) {
@@ -328,6 +388,35 @@ const formatTime = (timestamp: number) => {
   if (!timestamp) return '--';
   const date = new Date(timestamp * 1000);
   return date.toLocaleString();
+};
+
+const formatDuration = (seconds: number, ongoing: boolean = false) => {
+  const safeSeconds = Math.max(0, Number(seconds) || 0);
+  const hour = Math.floor(safeSeconds / 3600);
+  const minute = Math.floor((safeSeconds % 3600) / 60);
+  const second = safeSeconds % 60;
+
+  const base = hour > 0
+    ? `${hour}h ${minute}m ${second}s`
+    : (minute > 0 ? `${minute}m ${second}s` : `${second}s`);
+
+  return ongoing ? `${base} (持续中)` : base;
+};
+
+const formatEndReason = (reason?: string, ongoing: boolean = false) => {
+  if (ongoing) return '进行中';
+  const normalized = String(reason || '').trim().toLowerCase();
+  const map: Record<string, string> = {
+    ip_switched: 'IP切换',
+    status_degraded: '探活降级',
+    status_cooldown: '进入冷却',
+    status_rolled_back: '已回滚',
+    status_error: '异常',
+    status_disabled: '探活禁用',
+    status_unknown: '状态未知',
+    ongoing: '进行中',
+  };
+  return map[normalized] || (normalized ? normalized : '--');
 };
 
 const formatStatus = (status: string) => {
@@ -351,6 +440,7 @@ onMounted(async () => {
   pollTimer = window.setInterval(() => {
     loadProbeStatus();
     loadProbeHistory(60);
+    loadProbeIpUptime(20);
   }, 10000);
 });
 
@@ -527,11 +617,19 @@ onUnmounted(() => {
   border: 1px solid rgba(161, 172, 184, 0.16);
   background: rgba(161, 172, 184, 0.04);
   overflow: hidden;
+  height: 100%;
 }
 
 .probe-log-list {
   max-height: 540px;
   overflow-y: auto;
+}
+
+.logs-split {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+  gap: 1rem;
+  align-items: start;
 }
 
 .probe-log-row {
@@ -557,6 +655,66 @@ onUnmounted(() => {
   font-size: 0.9rem;
   color: var(--text-main);
   word-break: break-word;
+}
+
+.uptime-panel {
+  border-radius: 0.95rem;
+  border: 1px solid rgba(161, 172, 184, 0.16);
+  background: rgba(161, 172, 184, 0.04);
+  overflow: hidden;
+  height: 100%;
+}
+
+.uptime-panel-header {
+  padding: 0.95rem 1rem 0.65rem;
+  border-bottom: 1px solid rgba(161, 172, 184, 0.14);
+}
+
+.uptime-panel-header h4 {
+  margin: 0;
+  font-size: 0.95rem;
+}
+
+.uptime-panel-header p {
+  margin: 0.35rem 0 0;
+  color: var(--text-muted);
+  font-size: 0.82rem;
+}
+
+.uptime-table-wrap {
+  max-height: 540px;
+  overflow: auto;
+}
+
+.uptime-table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+}
+
+.uptime-table th,
+.uptime-table td {
+  padding: 0.7rem 0.95rem;
+  border-bottom: 1px solid rgba(161, 172, 184, 0.14);
+  font-size: 0.86rem;
+  text-align: left;
+  white-space: nowrap;
+}
+
+.uptime-table th {
+  color: var(--text-muted);
+  font-size: 0.78rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.uptime-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.uptime-empty {
+  padding-top: 1.4rem;
+  padding-bottom: 1.4rem;
 }
 
 .probe-badge {

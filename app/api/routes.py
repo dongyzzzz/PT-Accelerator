@@ -580,6 +580,16 @@ async def get_cloudflare_probe_history(
     items = hosts_manager.get_probe_history(safe_limit)
     return {"items": items, "count": len(items)}
 
+@router.get("/cloudflare-probe/ip-uptime")
+async def get_cloudflare_probe_ip_uptime(
+    limit: int = 20,
+    hosts_manager: HostsManager = Depends(get_hosts_manager)
+):
+    """获取探活正常IP维持区间记录"""
+    safe_limit = max(1, min(limit, 500))
+    items = hosts_manager.get_probe_ip_uptime_history(safe_limit)
+    return {"items": items, "count": len(items)}
+
 @router.post("/cloudflare-probe/run")
 async def run_cloudflare_probe(
     background_tasks: BackgroundTasks,

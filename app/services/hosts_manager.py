@@ -192,10 +192,109 @@ class HostsManager:
         self._save_probe_history()
         return event
 
+    def _format_probe_ts(self, ts: int) -> str:
+        """格式化探活时间戳"""
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts))
+
+    def _build_probe_uptime_item(
+        self,
+        ip: str,
+        start_ts: int,
+        end_ts: int,
+        ongoing: bool,
+        end_reason: str
+    ) -> Dict[str, Any]:
+        """构建单条IP稳定维持时段记录"""
+        safe_start = max(0, int(start_ts))
+        safe_end = max(safe_start, int(end_ts))
+        duration_seconds = max(0, safe_end - safe_start)
+        return {
+            "ip": ip,
+            "start_timestamp": safe_start,
+            "start_time": self._format_probe_ts(safe_start),
+            "end_timestamp": safe_end,
+            "end_time": self._format_probe_ts(safe_end),
+            "duration_seconds": duration_seconds,
+            "ongoing": bool(ongoing),
+            "end_reason": end_reason,
+        }
+
     def get_probe_history(self, limit: int = 100) -> List[Dict[str, Any]]:
         """获取探活历史（倒序，最新在前）"""
         safe_limit = self._safe_int(limit, 100, min_value=1)
         return list(reversed(self.probe_history[-safe_limit:]))
+
+    def get_probe_ip_uptime_history(self, limit: int = 20) -> List[Dict[str, Any]]:
+        """获取探活正常IP维持区间（倒序，最新在前）"""
+        safe_limit = self._safe_int(limit, 20, min_value=1)
+        stable_statuses = {"healthy", "refreshed"}
+        neutral_statuses = {"skipped"}
+
+        # 保护性拷贝+排序，避免历史文件异常导致计算错误
+        sorted_events = sorted(
+            [item for item in self.probe_history if isinstance(item, dict)],
+            key=lambda item: self._safe_int(item.get("timestamp", 0), 0, min_value=0)
+        )
+
+        periods: List[Dict[str, Any]] = []
+        active_ip = ""
+        active_start_ts = 0
+
+        for event in sorted_events:
+            ts = self._safe_int(event.get("timestamp", 0), 0, min_value=0)
+            if ts <= 0:
+                continue
+
+            status = str(event.get("status", "")).strip().lower()
+            current_ip = str(event.get("current_ip", "") or "").strip()
+            refreshed_ip = str(event.get("new_ip", "") or "").strip()
+            effective_ip = refreshed_ip if status == "refreshed" and refreshed_ip else current_ip
+
+            if status in stable_statuses and effective_ip:
+                if not active_ip:
+                    active_ip = effective_ip
+                    active_start_ts = ts
+                    continue
+
+                if effective_ip == active_ip:
+                    continue
+
+                periods.append(self._build_probe_uptime_item(
+                    ip=active_ip,
+                    start_ts=active_start_ts,
+                    end_ts=ts,
+                    ongoing=False,
+                    end_reason="ip_switched"
+                ))
+                active_ip = effective_ip
+                active_start_ts = ts
+                continue
+
+            if status in neutral_statuses:
+                continue
+
+            if active_ip:
+                periods.append(self._build_probe_uptime_item(
+                    ip=active_ip,
+                    start_ts=active_start_ts,
+                    end_ts=ts,
+                    ongoing=False,
+                    end_reason=f"status_{status or 'unknown'}"
+                ))
+                active_ip = ""
+                active_start_ts = 0
+
+        if active_ip:
+            now_ts = int(time.time())
+            periods.append(self._build_probe_uptime_item(
+                ip=active_ip,
+                start_ts=active_start_ts,
+                end_ts=max(now_ts, active_start_ts),
+                ongoing=True,
+                end_reason="ongoing"
+            ))
+
+        return list(reversed(periods[-safe_limit:]))
 
     def clear_probe_history(self) -> None:
         """清空探活历史"""
