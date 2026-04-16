@@ -10,6 +10,7 @@ import hashlib
 import yaml
 import re
 import socket
+import ssl
 import urllib3
 import json
 
@@ -42,8 +43,24 @@ class HostsManager:
         # 各订阅源标记模板
         self.source_start_mark = "# ===== %s开始 ===== #"
         self.source_end_mark = "# ===== %s结束 (%d 条记录) ===== #"
-        # 最新优选的Cloudflare IP
-        self.best_cloudflare_ip = None
+        # 最新优选的Cloudflare IP（初始化时优先从配置恢复）
+        self.best_cloudflare_ip = self._extract_configured_cloudflare_ip()
+        self.last_good_cloudflare_ip = self.best_cloudflare_ip
+        self.cf_probe_consecutive_failures = 0
+        self.last_reselect_ts = 0.0
+        self.last_probe_status = {"status": "unknown", "message": "未执行探活"}
+        self.probe_history_limit = 500
+        self.probe_history_path = os.path.join("config", "cloudflare_probe_history.json")
+        self.probe_history = self._load_probe_history()
+        if self.probe_history:
+            latest = self.probe_history[-1]
+            self.last_probe_status = {
+                "status": latest.get("status", "unknown"),
+                "message": latest.get("message", ""),
+                "timestamp": latest.get("timestamp", int(time.time()))
+            }
+            if latest.get("triggered_reselect"):
+                self.last_reselect_ts = float(latest.get("timestamp", 0) or 0)
         # 域名IP历史记录，用于在网络波动时提供兜底IP
         self.domain_ip_history = {}
         # IP检测失败重试次数
@@ -75,6 +92,427 @@ class HostsManager:
         # 自动同步Cloudflare白名单集合
         cf_domains_from_config = self.config.get('cloudflare_domains', [])
         self.cf_domains = set(cf_domains_from_config) if isinstance(cf_domains_from_config, list) else set([cf_domains_from_config])
+        # 配置更新后同步当前IP视图，保证探活与写入一致
+        self.best_cloudflare_ip = self._extract_configured_cloudflare_ip()
+        if not self.last_good_cloudflare_ip:
+            self.last_good_cloudflare_ip = self.best_cloudflare_ip
+
+    def _extract_configured_cloudflare_ip(self) -> str:
+        """从配置或nowip文件中恢复当前使用的Cloudflare IP"""
+        trackers = self.config.get("trackers", []) if isinstance(self.config, dict) else []
+        if isinstance(trackers, list):
+            for tracker in trackers:
+                if not isinstance(tracker, dict):
+                    continue
+                ip = str(tracker.get("ip", "")).strip()
+                if ip:
+                    return ip
+
+        nowip_path = "nowip_hosts.txt"
+        if os.path.exists(nowip_path):
+            try:
+                with open(nowip_path, "r", encoding="utf-8") as f:
+                    now_ip = f.readline().strip()
+                if now_ip:
+                    return now_ip
+            except Exception:
+                pass
+
+        return "104.16.91.215"
+
+    def _safe_int(self, value: Any, default: int, min_value: int = 0) -> int:
+        """安全读取整数配置并限制最小值"""
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(min_value, parsed)
+
+    def _get_cloudflare_probe_config(self) -> Dict[str, Any]:
+        """读取Cloudflare探活相关配置（带默认值和边界处理）"""
+        cloudflare_config = self.config.get("cloudflare", {}) if isinstance(self.config, dict) else {}
+        return {
+            "probe_enable": bool(cloudflare_config.get("probe_enable", True)),
+            "probe_fail_threshold": self._safe_int(cloudflare_config.get("probe_fail_threshold", 3), 3, min_value=1),
+            "cooldown_minutes": self._safe_int(cloudflare_config.get("cooldown_minutes", 15), 15, min_value=0),
+            "probe_timeout": self._safe_int(cloudflare_config.get("probe_timeout", 2), 2, min_value=1),
+        }
+
+    def _load_probe_history(self) -> List[Dict[str, Any]]:
+        """读取探活历史记录"""
+        if not os.path.exists(self.probe_history_path):
+            return []
+        try:
+            with open(self.probe_history_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return [item for item in data if isinstance(item, dict)][-self.probe_history_limit:]
+        except Exception as e:
+            logger.warning(f"读取Cloudflare探活历史失败: {e}")
+        return []
+
+    def _save_probe_history(self) -> None:
+        """持久化探活历史记录"""
+        try:
+            os.makedirs(os.path.dirname(self.probe_history_path), exist_ok=True)
+            with open(self.probe_history_path, "w", encoding="utf-8") as f:
+                json.dump(self.probe_history[-self.probe_history_limit:], f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"保存Cloudflare探活历史失败: {e}")
+
+    def _record_probe_event(
+        self,
+        *,
+        status: str,
+        healthy: bool,
+        message: str,
+        current_ip: str = "",
+        extra: Dict[str, Any] = None
+    ) -> Dict[str, Any]:
+        """记录一次探活执行结果"""
+        now = int(time.time())
+        event = {
+            "timestamp": now,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)),
+            "status": status,
+            "healthy": bool(healthy),
+            "message": message,
+            "current_ip": current_ip,
+            "best_cloudflare_ip": self.best_cloudflare_ip,
+            "last_good_cloudflare_ip": self.last_good_cloudflare_ip,
+            "consecutive_failures": self.cf_probe_consecutive_failures,
+        }
+        if extra and isinstance(extra, dict):
+            event.update(extra)
+
+        self.last_probe_status = {"status": status, "message": message, "timestamp": now}
+        self.probe_history.append(event)
+        if len(self.probe_history) > self.probe_history_limit:
+            self.probe_history = self.probe_history[-self.probe_history_limit:]
+        self._save_probe_history()
+        return event
+
+    def get_probe_history(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """获取探活历史（倒序，最新在前）"""
+        safe_limit = self._safe_int(limit, 100, min_value=1)
+        return list(reversed(self.probe_history[-safe_limit:]))
+
+    def clear_probe_history(self) -> None:
+        """清空探活历史"""
+        self.probe_history = []
+        self._save_probe_history()
+
+    def get_probe_runtime_status(self) -> Dict[str, Any]:
+        """获取探活运行时状态"""
+        probe_config = self._get_cloudflare_probe_config()
+        now = time.time()
+        cooldown_seconds = probe_config["cooldown_minutes"] * 60
+        cooldown_remaining = 0
+        if cooldown_seconds > 0 and self.last_reselect_ts > 0:
+            elapsed = now - self.last_reselect_ts
+            if elapsed < cooldown_seconds:
+                cooldown_remaining = int(cooldown_seconds - elapsed)
+
+        return {
+            "probe_config": probe_config,
+            "current_ip": self._resolve_current_cloudflare_ip(),
+            "best_cloudflare_ip": self.best_cloudflare_ip,
+            "last_good_cloudflare_ip": self.last_good_cloudflare_ip,
+            "consecutive_failures": self.cf_probe_consecutive_failures,
+            "last_reselect_ts": int(self.last_reselect_ts) if self.last_reselect_ts else 0,
+            "cooldown_remaining_seconds": cooldown_remaining,
+            "last_probe_status": self.last_probe_status,
+            "history_count": len(self.probe_history),
+            "task_running": self.task_running,
+        }
+
+    def _resolve_current_cloudflare_ip(self) -> str:
+        """获取当前用于探活的Cloudflare IP"""
+        return self.best_cloudflare_ip or self._extract_configured_cloudflare_ip()
+
+    def _normalize_domain_for_probe(self, domain: str) -> str:
+        """规范化域名字符串，移除协议/路径/端口"""
+        if not domain:
+            return ""
+        cleaned = str(domain).strip().lower()
+        cleaned = re.sub(r'^https?://', '', cleaned)
+        cleaned = cleaned.split('/')[0]
+        cleaned = re.sub(r':\d+$', '', cleaned)
+        return cleaned
+
+    def _collect_probe_domains(self, limit: int = 5) -> List[str]:
+        """采样启用的Tracker域名，供域名感知探活使用"""
+        domains: List[str] = []
+        trackers = self.config.get("trackers", []) if isinstance(self.config, dict) else []
+        if not isinstance(trackers, list):
+            return domains
+
+        for tracker in trackers:
+            if not isinstance(tracker, dict):
+                continue
+            if not tracker.get("enable"):
+                continue
+            normalized = self._normalize_domain_for_probe(tracker.get("domain", ""))
+            if not normalized:
+                continue
+            if normalized in domains:
+                continue
+            domains.append(normalized)
+            if len(domains) >= limit:
+                break
+        return domains
+
+    def _probe_domain_via_ip(self, ip: str, domain: str, timeout: int = 2) -> bool:
+        """通过指定IP直连并携带SNI/Host探测域名是否可用"""
+        if not ip or not domain:
+            return False
+
+        request = (
+            f"HEAD / HTTP/1.1\r\n"
+            f"Host: {domain}\r\n"
+            f"User-Agent: PT-Accelerator-Probe/1.0\r\n"
+            f"Connection: close\r\n\r\n"
+        ).encode("ascii", errors="ignore")
+
+        # HTTPS优先：TLS握手使用域名SNI，更贴近真实访问场景
+        try:
+            with socket.create_connection((ip, 443), timeout=timeout) as raw_sock:
+                context = ssl.create_default_context()
+                context.check_hostname = False
+                context.verify_mode = ssl.CERT_NONE
+                with context.wrap_socket(raw_sock, server_hostname=domain) as tls_sock:
+                    tls_sock.settimeout(timeout)
+                    tls_sock.sendall(request)
+                    head = tls_sock.recv(128)
+                    if head.startswith(b"HTTP/"):
+                        return True
+        except Exception:
+            pass
+
+        # HTTPS失败后，尝试HTTP直连
+        try:
+            with socket.create_connection((ip, 80), timeout=timeout) as plain_sock:
+                plain_sock.settimeout(timeout)
+                plain_sock.sendall(request)
+                head = plain_sock.recv(128)
+                if head.startswith(b"HTTP/"):
+                    return True
+        except Exception:
+            pass
+
+        return False
+
+    def _probe_ip_reachable(self, ip: str, timeout: int = 2, probe_domains: List[str] = None) -> bool:
+        """探活：优先做域名感知探测；无域名样本时退化为端口探测"""
+        if not ip:
+            return False
+
+        domains = [d for d in (probe_domains or []) if d]
+        if domains:
+            for domain in domains:
+                if self._probe_domain_via_ip(ip, domain, timeout=timeout):
+                    return True
+            # 有域名样本且全部失败时，直接判定不健康，避免TCP连通导致假阳性
+            return False
+
+        for port in (443, 80):
+            for _ in range(2):
+                try:
+                    with socket.create_connection((ip, port), timeout=timeout):
+                        return True
+                except Exception:
+                    continue
+        return False
+
+    def _apply_ip_to_enabled_trackers(self, ip: str) -> int:
+        """将指定IP应用到启用的Tracker（用于故障回滚）"""
+        updated_count = 0
+        trackers = self.config.get("trackers")
+        if not isinstance(trackers, list):
+            return updated_count
+
+        for tracker in trackers:
+            if not isinstance(tracker, dict):
+                continue
+            if not tracker.get("enable") or not tracker.get("domain"):
+                continue
+            tracker["ip"] = ip
+            updated_count += 1
+
+        if updated_count > 0:
+            self._merge_write_config({"trackers": self.config.get("trackers", [])})
+            self.update_config(self.config)
+            try:
+                import app.main
+                app.main.config = self.config
+            except Exception:
+                pass
+        return updated_count
+
+    def _rollback_to_last_good_ip(self, rollback_ip: str) -> Tuple[bool, str]:
+        """优选失败时回滚到最近一次可用IP并重建hosts"""
+        if not rollback_ip:
+            return False, "未找到可回滚的last_good_ip"
+
+        updated_count = self._apply_ip_to_enabled_trackers(rollback_ip)
+        if updated_count <= 0:
+            return False, f"回滚失败：未更新任何Tracker（目标IP: {rollback_ip}）"
+
+        self.best_cloudflare_ip = rollback_ip
+        rebuild_ok = self.update_hosts()
+        if rebuild_ok:
+            self.last_good_cloudflare_ip = rollback_ip
+            return True, f"已回滚到 last_good_ip: {rollback_ip}，并完成hosts重建"
+        return False, f"已回滚Tracker IP到 {rollback_ip}，但hosts重建失败"
+
+    def probe_current_cloudflare_ip(self) -> Dict[str, Any]:
+        """探活当前Cloudflare优选IP，失败累计到阈值后触发重优选与可选回滚"""
+        if self.task_running:
+            message = "探活跳过：当前已有任务在运行"
+            self._record_probe_event(status="skipped", healthy=True, message=message, current_ip=self._resolve_current_cloudflare_ip())
+            return {"status": "skipped", "healthy": True, "message": message}
+
+        probe_config = self._get_cloudflare_probe_config()
+        if not probe_config["probe_enable"]:
+            message = "探活已禁用"
+            self._record_probe_event(status="disabled", healthy=True, message=message, current_ip=self._resolve_current_cloudflare_ip())
+            return {"status": "disabled", "healthy": True, "message": message}
+
+        current_ip = self._resolve_current_cloudflare_ip()
+        timeout = probe_config["probe_timeout"]
+        threshold = probe_config["probe_fail_threshold"]
+        cooldown_seconds = probe_config["cooldown_minutes"] * 60
+        probe_domains = self._collect_probe_domains(limit=5)
+
+        is_healthy = self._probe_ip_reachable(current_ip, timeout=timeout, probe_domains=probe_domains)
+        now_ts = time.time()
+
+        if is_healthy:
+            self.cf_probe_consecutive_failures = 0
+            self.last_good_cloudflare_ip = current_ip
+            message = f"探活正常：{current_ip}"
+            self._record_probe_event(
+                status="healthy",
+                healthy=True,
+                message=message,
+                current_ip=current_ip,
+                extra={
+                    "fail_count": 0,
+                    "threshold": threshold,
+                    "probe_domains": probe_domains
+                }
+            )
+            return {"status": "healthy", "healthy": True, "message": message}
+
+        self.cf_probe_consecutive_failures += 1
+        fail_count = self.cf_probe_consecutive_failures
+        base_msg = f"探活失败({fail_count}/{threshold})：{current_ip} 不可达"
+
+        if fail_count < threshold:
+            self._record_probe_event(
+                status="degraded",
+                healthy=False,
+                message=base_msg,
+                current_ip=current_ip,
+                extra={
+                    "fail_count": fail_count,
+                    "threshold": threshold,
+                    "probe_domains": probe_domains
+                }
+            )
+            return {"status": "degraded", "healthy": False, "message": base_msg}
+
+        elapsed = now_ts - self.last_reselect_ts
+        if cooldown_seconds > 0 and elapsed < cooldown_seconds:
+            remaining = int(cooldown_seconds - elapsed)
+            cooldown_msg = f"{base_msg}，达到阈值但处于冷却期（剩余 {remaining} 秒）"
+            self._record_probe_event(
+                status="cooldown",
+                healthy=False,
+                message=cooldown_msg,
+                current_ip=current_ip,
+                extra={
+                    "fail_count": fail_count,
+                    "threshold": threshold,
+                    "cooldown_remaining_seconds": remaining,
+                    "probe_domains": probe_domains
+                }
+            )
+            return {"status": "cooldown", "healthy": False, "message": cooldown_msg}
+
+        # 触发重优选，冷却窗口用于限制重优选频率，避免反复抖动
+        self.last_reselect_ts = now_ts
+        run_result = self.run_cfst_and_update_hosts()
+        if isinstance(run_result, tuple):
+            reselect_ok, detail_msg = run_result
+        else:
+            reselect_ok = bool(run_result)
+            detail_msg = "Cloudflare优选完成" if reselect_ok else "Cloudflare优选失败"
+
+        if reselect_ok:
+            self.cf_probe_consecutive_failures = 0
+            new_ip = self._resolve_current_cloudflare_ip()
+            self.last_good_cloudflare_ip = new_ip
+            message = f"{base_msg}，已触发重优选并恢复，当前IP：{new_ip}"
+            self._record_probe_event(
+                status="refreshed",
+                healthy=True,
+                message=message,
+                current_ip=current_ip,
+                extra={
+                    "fail_count": fail_count,
+                    "threshold": threshold,
+                    "triggered_reselect": True,
+                    "new_ip": new_ip,
+                    "probe_domains": probe_domains
+                }
+            )
+            return {
+                "status": "refreshed",
+                "healthy": True,
+                "message": message,
+                "notify_message": f"探活触发重优选成功\n旧IP：{current_ip}\n新IP：{new_ip}"
+            }
+
+        rollback_msg = "未执行回滚"
+        rollback_ok = False
+        if self.last_good_cloudflare_ip:
+            rollback_ok, rollback_msg = self._rollback_to_last_good_ip(self.last_good_cloudflare_ip)
+
+        self.cf_probe_consecutive_failures = threshold
+        if rollback_ok:
+            final_msg = f"{base_msg}，重优选失败，已回滚到 {self.last_good_cloudflare_ip}"
+            status = "rolled_back"
+        else:
+            final_msg = f"{base_msg}，重优选失败且回滚失败"
+            status = "error"
+
+        self._record_probe_event(
+            status=status,
+            healthy=False,
+            message=final_msg,
+            current_ip=current_ip,
+            extra={
+                "fail_count": fail_count,
+                "threshold": threshold,
+                "triggered_reselect": True,
+                "reselect_detail": detail_msg,
+                "rollback_detail": rollback_msg,
+                "rolled_back_to": self.last_good_cloudflare_ip if rollback_ok else "",
+                "probe_domains": probe_domains
+            }
+        )
+        return {
+            "status": status,
+            "healthy": False,
+            "message": final_msg,
+            "notify_message": (
+                "探活触发重优选失败\n"
+                f"探活IP：{current_ip}\n"
+                f"重优选结果：{detail_msg}\n"
+                f"回滚结果：{rollback_msg}"
+            )
+        }
         
     def _merge_write_config(self, partial_update: Dict[str, Any]):
         """将局部更新安全合并写回 config/config.yaml，避免覆盖其它未修改配置"""
@@ -548,6 +986,8 @@ class HostsManager:
         
         # 设置最佳IP
         self.best_cloudflare_ip = ip
+        self.last_good_cloudflare_ip = ip
+        self.cf_probe_consecutive_failures = 0
         logger.info(f"设置最佳Cloudflare IP: {ip}")
         
         # 更新配置中的IP
@@ -594,6 +1034,9 @@ class HostsManager:
             if tracker.get("enable"):
                 tracker["ip"] = ip
                 logger.info(f"更新tracker {tracker.get('domain')} 的IP为 {ip}")
+        self.best_cloudflare_ip = ip
+        self.last_good_cloudflare_ip = ip
+        self.cf_probe_consecutive_failures = 0
         
         # 保存配置
         with open("config/config.yaml", 'w', encoding='utf-8') as f:
@@ -670,6 +1113,8 @@ class HostsManager:
                 self.task_running = False
                 return False, "优选失败: 未能提取到最优IP"
             self.best_cloudflare_ip = best_ip
+            self.last_good_cloudflare_ip = best_ip
+            self.cf_probe_consecutive_failures = 0
             logger.info(f"串行流程提取到最优IP: {best_ip}")
             filtered_trackers = []  # 确保后续统计时变量已定义
             if self.config.get("trackers"):
@@ -847,6 +1292,7 @@ class HostsManager:
             
             # 前端任务状态只显示简单信息
             self.task_status = {"status": "done", "message": "Cloudflare优选完成！"}
+            self.last_reselect_ts = time.time()
             self.task_running = False
             logger.info("已完成hosts文件更新")
             if self.pending_update:

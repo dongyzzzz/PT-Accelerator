@@ -24,6 +24,8 @@ const pageTitle = computed(() => {
       return '控制面板';
     case 'logs':
       return '日志查看';
+    case 'probe':
+      return '探活监控';
     case 'clients':
       return '下载器管理';
     case 'hosts':

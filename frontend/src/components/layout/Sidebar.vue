@@ -26,6 +26,12 @@
             <span class="nav-label">日志查看</span>
           </router-link>
         </li>
+        <li class="nav-item">
+          <router-link to="/probe" class="nav-link" active-class="active" data-nav-key="probe">
+            <i class="bx bx-heart-circle nav-icon"></i>
+            <span class="nav-label">探活监控</span>
+          </router-link>
+        </li>
         
         <li class="nav-header">
           <div class="title-wrapper">
@@ -157,6 +163,7 @@ const isSettingsRoute = computed(() => route.path.startsWith('/settings'));
 const activeMainKey = computed(() => {
   if (route.path === '/') return 'dashboard';
   if (route.path.startsWith('/logs')) return 'logs';
+  if (route.path.startsWith('/probe')) return 'probe';
   if (route.path.startsWith('/clients')) return 'clients';
   if (route.path.startsWith('/hosts')) return 'hosts';
   if (route.path.startsWith('/trackers')) return 'trackers';

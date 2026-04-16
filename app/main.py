@@ -48,7 +48,12 @@ DEFAULT_CONFIG = {
         "cron": "0 0 * * *",  # 每天零点运行
         "ipv6": False,
         "additional_args": "",
-        "notify": True
+        "notify": True,
+        "probe_enable": True,
+        "probe_cron": "*/5 * * * *",
+        "probe_fail_threshold": 3,
+        "cooldown_minutes": 15,
+        "probe_timeout": 2
     },
     "trackers": [
         {
@@ -243,7 +248,12 @@ DEFAULT_CONFIG = {
         "cron": "0 0 * * *",  # 每天零点运行
         "ipv6": False,
         "additional_args": "",
-        "notify": True
+        "notify": True,
+        "probe_enable": True,
+        "probe_cron": "*/5 * * * *",
+        "probe_fail_threshold": 3,
+        "cooldown_minutes": 15,
+        "probe_timeout": 2
     },
     "trackers": [
         {

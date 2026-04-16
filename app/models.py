@@ -18,6 +18,11 @@ class HostsSource(BaseModel):
 class CloudflareConfig(BaseModel):
     enable: bool = True
     cron: str = "0 0 * * *"
+    probe_enable: bool = True
+    probe_cron: str = "*/5 * * * *"
+    probe_fail_threshold: int = 3
+    cooldown_minutes: int = 15
+    probe_timeout: int = 2
     # Add other Cloudflare related fields if necessary
 
 class TorrentClientConfig(BaseModel):

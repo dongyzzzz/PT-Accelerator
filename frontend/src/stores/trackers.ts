@@ -14,6 +14,11 @@ export interface CloudflareConfig {
     ipv6?: boolean;
     additional_args?: string;
     notify?: boolean;
+    probe_enable?: boolean;
+    probe_cron?: string;
+    probe_fail_threshold?: number;
+    cooldown_minutes?: number;
+    probe_timeout?: number;
 }
 
 export const useTrackerStore = defineStore('trackers', {
@@ -22,6 +27,11 @@ export const useTrackerStore = defineStore('trackers', {
         cloudflare: {
             enable: true,
             cron: '0 0 * * *',
+            probe_enable: true,
+            probe_cron: '*/5 * * * *',
+            probe_fail_threshold: 3,
+            cooldown_minutes: 15,
+            probe_timeout: 2,
         } as CloudflareConfig,
         loading: false,
     }),

@@ -60,7 +60,7 @@
               </label>
               <div>
                 <strong>启用定时任务</strong>
-                <p>关闭后将暂停自动调度，仅保留手动执行能力。</p>
+                <p>仅控制“IP优选与Hosts更新定时任务”。探活任务请在探活监控页单独开关。</p>
               </div>
             </div>
 
@@ -239,7 +239,7 @@ const handleClearAndUpdate = async () => {
 const saveCloudflareSettings = async () => {
   savingCf.value = true;
   try {
-    await trackerStore.saveCloudflareConfig({ ...cfConfig });
+    await trackerStore.saveCloudflareConfig({ ...trackerStore.cloudflare, ...cfConfig });
     toast.success('保存成功');
     fetchStatus(); // Refresh status as changing config might restart scheduler
   } catch (e) {

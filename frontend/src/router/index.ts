@@ -42,6 +42,11 @@ const router = createRouter({
                     component: () => import('../views/dashboard/Logs.vue'),
                 },
                 {
+                    path: 'probe',
+                    name: 'probe',
+                    component: () => import('../views/dashboard/Probe.vue'),
+                },
+                {
                     path: 'settings',
                     redirect: '/settings/system',
                 },

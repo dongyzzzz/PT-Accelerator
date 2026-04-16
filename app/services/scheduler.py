@@ -50,6 +50,8 @@ class SchedulerService:
         # 检查CRON是否变更 (Cloudflare 或 Backup)
         old_cf_cron = old_config.get("cloudflare", {}).get("cron", "0 0 * * *")
         new_cf_cron = config.get("cloudflare", {}).get("cron", "0 0 * * *")
+        old_probe_cron = old_config.get("cloudflare", {}).get("probe_cron", "*/5 * * * *")
+        new_probe_cron = config.get("cloudflare", {}).get("probe_cron", "*/5 * * * *")
         
         old_bk_cron = old_config.get("backup", {}).get("cron", "0 2 * * *")
         new_bk_cron = config.get("backup", {}).get("cron", "0 2 * * *")
@@ -57,8 +59,16 @@ class SchedulerService:
         # 检查启用状态变更
         old_bk_enable = old_config.get("backup", {}).get("enable", False)
         new_bk_enable = config.get("backup", {}).get("enable", False)
+        old_probe_enable = old_config.get("cloudflare", {}).get("probe_enable", True)
+        new_probe_enable = config.get("cloudflare", {}).get("probe_enable", True)
 
-        if (old_cf_cron != new_cf_cron) or (old_bk_cron != new_bk_cron) or (old_bk_enable != new_bk_enable):
+        if (
+            (old_cf_cron != new_cf_cron)
+            or (old_probe_cron != new_probe_cron)
+            or (old_bk_cron != new_bk_cron)
+            or (old_bk_enable != new_bk_enable)
+            or (old_probe_enable != new_probe_enable)
+        ):
             logger.info("定时任务配置变更，需要重启调度器")
             
             # 如果调度器正在运行，需要重启调度器
@@ -101,7 +111,12 @@ class SchedulerService:
                     # 更新任务状态
                     self.task_status = {"status": "running", "message": "正在执行定时IP优选任务"}
                     try:
-                        ok, notify_msg = self.hosts_manager.run_cfst_and_update_hosts()
+                        run_result = self.hosts_manager.run_cfst_and_update_hosts()
+                        if isinstance(run_result, tuple):
+                            ok, notify_msg = run_result
+                        else:
+                            ok = bool(run_result)
+                            notify_msg = "Cloudflare优选完成" if ok else "Cloudflare优选失败"
                         status = self.hosts_manager.get_task_status() if hasattr(self.hosts_manager, 'get_task_status') else {}
                         # status['message'] is now the SHORT message
                         short_msg = status.get('message') if isinstance(status, dict) else ("定时IP优选任务完成" if ok else "定时IP优选任务失败")
@@ -150,6 +165,52 @@ class SchedulerService:
                 logger.error(f"添加组合定时任务失败: {str(e)}")
         else:
             logger.info("CloudflareSpeedTest优选功能已禁用，不添加相关定时任务")
+
+        # 添加轻量探活任务（与“IP优选与Hosts更新定时任务”开关解耦）
+        if cloudflare_config.get("probe_enable", True):
+            probe_cron_expr = cloudflare_config.get("probe_cron", "*/5 * * * *")
+            logger.info(f"准备添加Cloudflare探活任务，CRON表达式: {probe_cron_expr}")
+            try:
+                def probe_task():
+                    import time
+                    task_start_time = time.time()
+                    logger.info("开始执行Cloudflare IP探活任务")
+                    self.task_status = {"status": "running", "message": "正在执行Cloudflare IP探活任务"}
+                    try:
+                        probe_result = self.hosts_manager.probe_current_cloudflare_ip()
+                        short_msg = probe_result.get("message", "Cloudflare IP探活完成")
+                        self.task_status = {"status": "done", "message": short_msg}
+                        logger.info(f"Cloudflare IP探活完成: {short_msg}")
+
+                        notify_msg = probe_result.get("notify_message")
+                        if notify_msg and cloudflare_config.get("notify", True):
+                            try:
+                                from app.api.routes import _send_task_notify
+                                _send_task_notify("Cloudflare IP探活", notify_msg)
+                                logger.info("[定时任务通知] Cloudflare IP探活通知已发送")
+                            except Exception as notify_e:
+                                logger.error(f"发送Cloudflare IP探活通知失败: {str(notify_e)}")
+                    except Exception as e:
+                        error_msg = f"Cloudflare IP探活任务失败: {str(e)}"
+                        self.task_status = {"status": "done", "message": error_msg}
+                        logger.error(error_msg, exc_info=True)
+                    finally:
+                        logger.info(f"Cloudflare IP探活任务结束，耗时 {time.time() - task_start_time:.2f} 秒")
+
+                self.scheduler.add_job(
+                    probe_task,
+                    CronTrigger.from_crontab(probe_cron_expr),
+                    id="cloudflare_ip_probe_task",
+                    name="Cloudflare IP探活任务",
+                    max_instances=1,
+                    coalesce=True,
+                    misfire_grace_time=300
+                )
+                logger.info(f"已添加Cloudflare探活任务，CRON表达式: {probe_cron_expr}")
+            except Exception as e:
+                logger.error(f"添加Cloudflare探活任务失败: {str(e)}")
+        else:
+            logger.info("Cloudflare探活功能已禁用，不添加探活任务")
 
         # 添加备份定时任务
         backup_config = self.config.get("backup", {})

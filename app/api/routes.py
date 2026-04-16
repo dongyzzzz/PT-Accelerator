@@ -134,7 +134,12 @@ def _is_valid_notify_payload(flat: Dict[str, Any], minimal_keys_sets: List[tuple
 def _queue_cfst_update_task(background_tasks: BackgroundTasks, hosts_manager: HostsManager, startup_message: str):
     def combined_task():
         logger.info("手动执行组合任务：优选IP + 更新tracker + 更新hosts（严格串行）")
-        ok, notify_msg = hosts_manager.run_cfst_and_update_hosts()
+        run_result = hosts_manager.run_cfst_and_update_hosts()
+        if isinstance(run_result, tuple):
+            ok, notify_msg = run_result
+        else:
+            ok = bool(run_result)
+            notify_msg = "Cloudflare优选完成" if ok else "Cloudflare优选失败"
         status = hosts_manager.get_task_status() if hasattr(hosts_manager, 'get_task_status') else {}
         short_msg = status.get('message') if isinstance(status, dict) else ("执行完成" if ok else "执行失败")
         log_msg = short_msg.split('\n')[0] if short_msg else ""
@@ -338,6 +343,28 @@ async def update_config(
         cron_expr = config_data.get("cloudflare", {}).get("cron", "0 0 * * *")
         if not croniter.is_valid(cron_expr):
             raise HTTPException(status_code=400, detail="CRON表达式无效，请检查格式")
+        probe_enable = config_data.get("cloudflare", {}).get("probe_enable", True)
+        if probe_enable:
+            probe_cron_expr = config_data.get("cloudflare", {}).get("probe_cron", "*/5 * * * *")
+            if not croniter.is_valid(probe_cron_expr):
+                raise HTTPException(status_code=400, detail="探活CRON表达式无效，请检查格式")
+            try:
+                threshold = int(config_data.get("cloudflare", {}).get("probe_fail_threshold", 3))
+                cooldown = int(config_data.get("cloudflare", {}).get("cooldown_minutes", 15))
+                probe_timeout = int(config_data.get("cloudflare", {}).get("probe_timeout", 2))
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="探活参数必须为数字")
+            if threshold < 1:
+                raise HTTPException(status_code=400, detail="探活失败阈值必须大于等于1")
+            if cooldown < 0:
+                raise HTTPException(status_code=400, detail="冷却时间不能小于0")
+            if probe_timeout < 1:
+                raise HTTPException(status_code=400, detail="探活超时必须大于等于1秒")
+            # 归一化数值，防止前端传入字符串
+            config_data.setdefault("cloudflare", {})
+            config_data["cloudflare"]["probe_fail_threshold"] = threshold
+            config_data["cloudflare"]["cooldown_minutes"] = cooldown
+            config_data["cloudflare"]["probe_timeout"] = probe_timeout
         
         # 保存配置
         with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
@@ -535,6 +562,48 @@ async def get_scheduler_status(
         "running": scheduler_service.is_running(),
         "jobs": scheduler_service.get_jobs()
     }
+
+@router.get("/cloudflare-probe/status")
+async def get_cloudflare_probe_status(
+    hosts_manager: HostsManager = Depends(get_hosts_manager)
+):
+    """获取Cloudflare探活运行状态"""
+    return hosts_manager.get_probe_runtime_status()
+
+@router.get("/cloudflare-probe/history")
+async def get_cloudflare_probe_history(
+    limit: int = 100,
+    hosts_manager: HostsManager = Depends(get_hosts_manager)
+):
+    """获取Cloudflare探活历史记录"""
+    safe_limit = max(1, min(limit, 500))
+    items = hosts_manager.get_probe_history(safe_limit)
+    return {"items": items, "count": len(items)}
+
+@router.post("/cloudflare-probe/run")
+async def run_cloudflare_probe(
+    background_tasks: BackgroundTasks,
+    hosts_manager: HostsManager = Depends(get_hosts_manager)
+):
+    """手动触发一次Cloudflare探活任务"""
+    def probe_task():
+        result = hosts_manager.probe_current_cloudflare_ip()
+        message = result.get("message", "Cloudflare探活任务完成")
+        logger.info(f"[任务通知] Cloudflare探活 -> {message}")
+        notify_msg = result.get("notify_message")
+        if notify_msg:
+            _send_task_notify("Cloudflare IP探活", notify_msg)
+
+    background_tasks.add_task(probe_task)
+    return {"message": "Cloudflare探活任务已启动"}
+
+@router.post("/cloudflare-probe/history/clear")
+async def clear_cloudflare_probe_history(
+    hosts_manager: HostsManager = Depends(get_hosts_manager)
+):
+    """清空Cloudflare探活历史记录"""
+    hosts_manager.clear_probe_history()
+    return {"message": "Cloudflare探活历史已清空"}
 
 # 兼容旧版前端，避免404错误
 @router.get("/last-result")
